@@ -6,8 +6,39 @@ import (
 	"forum/controllers"
 	"forum/pkgs/funcs"
 	"log"
+	"net"
 	"net/http"
+	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 )
+
+type ClientLimiter struct {
+	limiter map[string]*rate.Limiter
+	mu      sync.Mutex
+}
+
+func newClientLimiter() *ClientLimiter {
+	return &ClientLimiter{
+		limiter: make(map[string]*rate.Limiter),
+	}
+}
+
+func (cl *ClientLimiter) getLimiter(ip string) *rate.Limiter {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	limiter, exists := cl.limiter[ip]
+	if !exists {
+		limiter = rate.NewLimiter(2, 5) // Adjust rate and burst as needed
+		cl.limiter[ip] = limiter
+	}
+
+	return limiter
+}
+
+var clientLimiter = newClientLimiter()
 
 func main() {
 	funcs.Init()
@@ -18,17 +49,36 @@ func main() {
 	// Handle requests for files in the "/static/" path
 	http.Handle("/static/", http.StripPrefix("/static/", fs))
 
+	rateLimitMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ip, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				return
+			}
+
+			limiter := clientLimiter.getLimiter(ip)
+
+			if !limiter.Allow() {
+				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	// API endpoints
-	http.HandleFunc("/signup", api.SignUp)                               // Handle signup
-	http.HandleFunc("/login", api.LogIn)                                 // Handle login
-	http.HandleFunc("/api/create_post", api.Create_Post)                 // create post
-	http.HandleFunc("/api/create_category", api.Create_Category_Handler) // create category
-	http.HandleFunc("/api/add_comment", api.AddCommentHandler)           // Handle Create comment
-	http.HandleFunc("/api/likes_post", api.LikesPostHandler)             // Handle Likes & Dislikes for Posts
-	http.HandleFunc("/api/likes_comment", api.LikesCommentHandler)       // Handle Likes & Dislikes for Posts
-	http.HandleFunc("/api/posts", api.GetPostsHandler)                   // Retrive posts as JSON
-	http.HandleFunc("/api/post/", api.Get_post_handler)                  // Retrive one post ex: /post/2
-	http.HandleFunc("/api/comments", api.Serve_comments_handler)         // Serves post comments
+	http.Handle("/signup", rateLimitMiddleware(http.HandlerFunc(api.SignUp)))                               // Handle signup
+	http.Handle("/login", rateLimitMiddleware(http.HandlerFunc(api.LogIn)))                                 // Handle login
+	http.Handle("/api/create_post", rateLimitMiddleware(http.HandlerFunc(api.Create_Post)))                 // create post
+	http.Handle("/api/create_category", rateLimitMiddleware(http.HandlerFunc(api.Create_Category_Handler))) // create category
+	http.Handle("/api/add_comment", rateLimitMiddleware(http.HandlerFunc(api.AddCommentHandler)))           // Handle Create comment
+	http.Handle("/api/likes_post", rateLimitMiddleware(http.HandlerFunc(api.LikesPostHandler)))             // Handle Likes & Dislikes for Posts
+	http.Handle("/api/likes_comment", rateLimitMiddleware(http.HandlerFunc(api.LikesCommentHandler)))       // Handle Likes & Dislikes for Posts
+	http.Handle("/api/posts", rateLimitMiddleware(http.HandlerFunc(api.GetPostsHandler)))                   // Retrieve posts as JSON
+	http.Handle("/api/post/", rateLimitMiddleware(http.HandlerFunc(api.Get_post_handler)))                  // Retrieve one post ex: /post/2
+	http.Handle("/api/comments", rateLimitMiddleware(http.HandlerFunc(api.Serve_comments_handler)))         // Serves post comments
 
 	// Render pages
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -44,53 +94,23 @@ func main() {
 		controllers.RenderUserPage(w, r, funcs.DB)
 	})
 
-	fmt.Println("Server listening on port http://localhost:8080 ...")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Use your actual SSL certificate and private key filenames
+	certFile := "cert.pem"
+	keyFile := "key.pem"
+
+	// Set reduced timeouts for read, write, and idle
+	server := &http.Server{
+		Addr:         ":8080",
+		TLSConfig:    nil,              // Use default TLS configuration
+		ReadTimeout:  5 * time.Second,  // Reduce read timeout to 5 seconds
+		WriteTimeout: 5 * time.Second,  // Reduce write timeout to 5 seconds
+		IdleTimeout:  10 * time.Second, // Reduce idle timeout to 10 seconds
+	}
+
+	fmt.Println("Server listening on port https://localhost:8080 ...")
+	log.Fatal(server.ListenAndServeTLS(certFile, keyFile))
 
 	if err := funcs.DB.Close(); err != nil {
-		fmt.Println("Error :", err)
+		fmt.Println("Error:", err)
 	}
-}
-
-// A middleware used for authenticate access to participate in the forum
-// All create, edit, post, comment handlers should be passed in this middleware handler
-func session_midddle(in_http http.Handler) http.Handler {
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie, err := r.Cookie("session_token")
-		if err != nil {
-			if err == http.ErrNoCookie {
-				// If the cookie is not set, return an unauthorized status
-				w.WriteHeader(http.StatusUnauthorized)
-				return
-			}
-			// For any other type of error, return a bad request status
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		// Get cookie value
-		session_token := cookie.Value
-
-		// We then get the session from our session map
-		userSession, exists := api.Sessions[session_token]
-		if !exists {
-			// If the session token is not present in session map, return an unauthorized error
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		// If the session is present, but has expired, we can delete the session, and return
-		// an unauthorized status
-		if userSession.IsExpired() {
-			delete(api.Sessions, session_token)
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		// If the session is valid, return a welcome message to the user
-		fmt.Fprintf(w, "Welcome %d!", userSession.Get_UserID())
-
-		in_http.ServeHTTP(w, r)
-	})
 }
